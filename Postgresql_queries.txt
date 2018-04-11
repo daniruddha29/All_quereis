@@ -321,4 +321,24 @@ FROM pg_class c
 WHERE relkind = 'r' and pg_table_size(oid) > 1073741824
 ORDER BY age(relfrozenxid) DESC LIMIT 20;
 ====================================================================================================
+SELECT sum(n_tup_ins) AS ins, sum(n_tup_upd) AS upd, sum(n_tup_del) AS del, sum(n_tup_hot_upd) AS hot_upd FROM pg_stat_user_tables;
+
+SELECT sum(n_live_tup) AS live, sum(n_dead_tup) AS dead FROM pg_stat_user_tables;
+
+
+SELECT sum(seq_scan) AS seq, sum(seq_tup_read) AS seq_tup_read, sum(idx_scan) AS idx, sum(idx_tup_fetch) AS idx_tup_fetch FROM pg_stat_user_tables;
+
+SELECT coalesce(sum(heap_blks_read), 0) AS heap_read, coalesce(sum(heap_blks_hit), 0) AS heap_hit,
+ coalesce(sum(idx_blks_read), 0) AS idx_read, 
+ coalesce(sum(idx_blks_hit), 0) AS idx_hit, 
+ coalesce(sum(toast_blks_read), 0) AS toast_read,
+ coalesce(sum(toast_blks_hit), 0) AS toast_hit,
+ coalesce(sum(tidx_blks_read), 0) AS tidx_read,
+ coalesce(sum(tidx_blks_hit), 0) AS tidx_hit 
+ FROM pg_statio_user_tables;
+ 
+SELECT sum(total_time)/sum(calls) AS avg_querytime FROM
+collectd.get_stat_statements() ;
+
+SELECT CASE WHEN pg_is_in_recovery='false' THEN 0 ELSE COALESCE(ROUND(EXTRACT(epoch FROM now() - pg_last_xact_replay_timestamp())),0) END AS seconds FROM pg_is_in_recovery();
 ====================================================================================================
