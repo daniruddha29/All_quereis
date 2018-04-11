@@ -1,0 +1,324 @@
+Query to get bloat on table indices
+======================================================================================================
+
+  SELECT
+    current_database(), schemaname, tablename, /*reltuples::bigint, relpages::bigint, otta,*/
+    ROUND((CASE WHEN otta=0 THEN 0.0 ELSE sml.relpages::FLOAT/otta END)::NUMERIC,1) AS tbloat,
+    CASE WHEN relpages < otta THEN 0 ELSE bs*(sml.relpages-otta)::BIGINT END AS wastedbytes,
+    iname, /*ituples::bigint, ipages::bigint, iotta,*/
+    ROUND((CASE WHEN iotta=0 OR ipages=0 THEN 0.0 ELSE ipages::FLOAT/iotta END)::NUMERIC,1) AS ibloat,
+    CASE WHEN ipages < iotta THEN 0 ELSE bs*(ipages-iotta) END AS wastedibytes
+  FROM (
+    SELECT
+      schemaname, tablename, cc.reltuples, cc.relpages, bs,
+      CEIL((cc.reltuples*((datahdr+ma-
+        (CASE WHEN datahdr%ma=0 THEN ma ELSE datahdr%ma END))+nullhdr2+4))/(bs-20::FLOAT)) AS otta,
+      COALESCE(c2.relname,'?') AS iname, COALESCE(c2.reltuples,0) AS ituples, COALESCE(c2.relpages,0) AS ipages,
+      COALESCE(CEIL((c2.reltuples*(datahdr-12))/(bs-20::FLOAT)),0) AS iotta -- very rough approximation, assumes all cols
+    FROM (
+      SELECT
+        ma,bs,schemaname,tablename,
+        (datawidth+(hdr+ma-(CASE WHEN hdr%ma=0 THEN ma ELSE hdr%ma END)))::NUMERIC AS datahdr,
+        (maxfracsum*(nullhdr+ma-(CASE WHEN nullhdr%ma=0 THEN ma ELSE nullhdr%ma END))) AS nullhdr2
+      FROM (
+        SELECT
+          schemaname, tablename, hdr, ma, bs,
+          SUM((1-null_frac)*avg_width) AS datawidth,
+          MAX(null_frac) AS maxfracsum,
+          hdr+(
+            SELECT 1+COUNT(*)/8
+            FROM pg_stats s2
+            WHERE null_frac<>0 AND s2.schemaname = s.schemaname AND s2.tablename = s.tablename
+          ) AS nullhdr
+        FROM pg_stats s, (
+          SELECT
+            (SELECT current_setting('block_size')::NUMERIC) AS bs,
+            CASE WHEN SUBSTRING(v,12,3) IN ('8.0','8.1','8.2') THEN 27 ELSE 23 END AS hdr,
+            CASE WHEN v ~ 'mingw32' THEN 8 ELSE 4 END AS ma
+          FROM (SELECT version() AS v) AS foo
+        ) AS constants
+        GROUP BY 1,2,3,4,5
+      ) AS foo
+    ) AS rs
+    JOIN pg_class cc ON cc.relname = rs.tablename
+    JOIN pg_namespace nn ON cc.relnamespace = nn.oid AND nn.nspname = rs.schemaname AND nn.nspname <> 'information_schema'
+    LEFT JOIN pg_index i ON indrelid = cc.oid
+    LEFT JOIN pg_class c2 ON c2.oid = i.indexrelid
+  ) AS sml
+  ORDER BY wastedbytes DESC;
+  
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+/* WARNING: executed with a non-superuser role, the query inspect only tables you 
+are granted to read.
+* This query is compatible with PostgreSQL 9.0 and more
+*/
+
+SELECT current_database(), schemaname, tblname, bs*tblpages AS real_size,
+ (tblpages-est_tblpages)*bs AS extra_size,
+ CASE WHEN tblpages - est_tblpages > 0
+ THEN 100 * (tblpages - est_tblpages)/tblpages::float
+ ELSE 0
+ END AS extra_ratio, fillfactor, (tblpages-est_tblpages_ff)*bs AS bloat_size,
+ CASE WHEN tblpages - est_tblpages_ff > 0
+ THEN 100 * (tblpages - est_tblpages_ff)/tblpages::float
+ ELSE 0
+ END AS bloat_ratio, is_na
+ -- , (pst).free_percent + (pst).dead_tuple_percent AS real_frag
+FROM (
+ SELECT ceil( reltuples / ( (bs-page_hdr)/tpl_size ) ) + ceil( toasttuples / 4 ) AS 
+ est_tblpages, ceil( reltuples / ( (bs-page_hdr)*fillfactor/(tpl_size*100) ) ) + 
+ ceil( toasttuples / 4 ) AS est_tblpages_ff, tblpages, fillfactor, bs, tblid, 
+ schemaname, tblname, heappages, toastpages, is_na
+ -- , stattuple.pgstattuple(tblid) AS pst
+ FROM (
+ SELECT
+ ( 4 + tpl_hdr_size + tpl_data_size + (2*ma)
+ - CASE WHEN tpl_hdr_size%ma = 0 THEN ma ELSE tpl_hdr_size%ma END
+ - CASE WHEN ceil(tpl_data_size)::int%ma = 0 THEN ma ELSE ceil(tpl_data_size)::int%ma 
+ END ) AS tpl_size, bs - page_hdr AS size_per_block, (heappages + toastpages) AS 
+ tblpages, heappages, toastpages, reltuples, toasttuples, bs, page_hdr, tblid, 
+ schemaname, tblname, fillfactor, is_na
+ FROM (
+ SELECT
+ tbl.oid AS tblid, ns.nspname AS schemaname, tbl.relname AS tblname, tbl.reltuples,
+ tbl.relpages AS heappages, coalesce(toast.relpages, 0) AS toastpages,
+ coalesce(toast.reltuples, 0) AS toasttuples,
+ coalesce(substring(
+ array_to_string(tbl.reloptions, ' ')
+ FROM '%fillfactor=#"__#"%' FOR '#')::smallint, 100) AS fillfactor,
+ current_setting('block_size')::numeric AS bs,
+ CASE WHEN version()~'mingw32' OR version()~'64-bit|x86_64|ppc64|ia64|amd64' THEN 8 
+ ELSE 4 END AS ma, 24 AS page_hdr, 23 + CASE WHEN MAX(coalesce(null_frac,0)) > 0 THEN 
+ ( 7 + count(*) ) / 8 ELSE 0::int END
+ + CASE WHEN tbl.relhasoids THEN 4 ELSE 0 END AS tpl_hdr_size,
+ sum( (1-coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024) ) AS tpl_data_size,
+ bool_or(att.atttypid = 'pg_catalog.name'::regtype) AS is_na
+ FROM pg_attribute AS att
+ JOIN pg_class AS tbl ON att.attrelid = tbl.oid
+ JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+ JOIN pg_stats AS s ON s.schemaname=ns.nspname
+ AND s.tablename = tbl.relname AND s.inherited=false AND s.attname=att.attname
+ LEFT JOIN pg_class AS toast ON tbl.reltoastrelid = toast.oid
+ WHERE att.attnum > 0 AND NOT att.attisdropped
+ AND tbl.relkind = 'r'
+ GROUP BY 1,2,3,4,5,6,7,8,9,10, tbl.relhasoids
+ ORDER BY 2,3
+ ) AS s
+ ) AS s2
+ ) AS s3;
+ -- WHERE NOT is_na
+ -- AND tblpages*((pst).free_percent + (pst).dead_tuple_percent)::float4/100 >= 1
+======================================================================================================
+
+Get database size : 
+
+The pg_database_size() function gives you the size of the DB. It accept the OID or name of a database and return the total disk space used therein.
+
+It can be called from the PSQL prompt as shown below:
+SELECT pg_database_size('postgres');
+
+
+To check the database size for all the databases in a cluser:
+SELECT pg_database.datname,pg_size_pretty(pg_database_size(pg_database.datname)) AS size FROM pg_database;
+
+======================================================================================================
+
+Postgres uses special switches in the pg_dump utility to extract DDL statements for a specific schema. Please note the following example for extracting the DDL for a specific schema:
+
+ 
+
+./pg_dump -s -n <schema  name> -p <port> <dbname> >> out.sql
+
+Where:
+
+1. "-s" is used to get the schema/structure information only
+
+2. "-n" is used to specify for which schema we need to extract the DDL statements
+
+3. An output file 'out.sql' will be created in the same location where you have the pg_dump binary 'out.sql' will have the extracted DDL statements for your schema.
+
+
+======================================================================================================  
+
+Check oldest tables for transaction wraparround 
+
+SELECT oid::regclass, relfrozenxid, age(relfrozenxid), relminmxid FROM pg_class WHERE relfrozenxid::text != '0';
+
+=======================================================================================================
+How to find IDLE connections in the database
+
+Storing of query strings is usually disabled in PostgreSQL by default.  To enable it, use this line in your postgresql.conf
+
+stats_command_string = true
+
+This setting can be changed on a running database without restarting or effecting open connections by telling the PostgreSQL parent process, postmaster, to reload its config.  Send it a SIGHUP or use the safer pg_ctl command with the reload option.  Example:
+
+pg_ctl reload
+
+When stats_command_string is enabled the pg_stat_activity table holds all currently active query strings.  The simplest query will show all current query strings along with which database they refer to and the process ID (PID) of the process serving that query.
+
+SELECT datname,procpid,current_query FROM pg_stat_activity
+
+Example:
+SELECT datname,pid,query FROM pg_stat_activity ORDER BY pid;
+database1=# SELECT datname,procpid,current_query FROM pg_stat_activity ORDER BY procpid ;
+    datname    | procpid | current_query 
+---------------+---------+---------------
+ mydatabaseabc |    2587 | <IDLE>
+ anotherdb     |   15726 | SELECT * FROM users WHERE id=123 ;  
+ mydatabaseabc |   15851 | <IDLE>
+(3 rows)
+
+Each row of pg_stat_activity represents one PostgreSQL process (PostgreSQL uses one server process per connection).
+
+Any processes that are not currently performing any queries will show <IDLE> as the current_query.
+
+====================================================================================================
+
+How to get the current query start time with a pre-defined function?
+
+Predefined function called pg_stat_get_backend_activity_start(integer) gives the time at which the given server process' currently executing query was started, but only if the current user is a superuser or the same user as that of the session being queried (and stats_command_string is on) 
+
+
+edb=# SELECT pg_stat_get_backend_pid(s.backendid) AS procpid, pg_stat_get_backend_activity(s.backendid) AS current_query, pg_stat_get_backend_activity_start(s.backendid) AS FROM (SELECT pg_stat_get_backend_idset() AS backendid) AS s; 
+
+procpid | current_query | t 
+---------+-------------------------------------------------------------------------------------------------------------------------+---------------------------------- 
+3875 | <IDLE> | 04-DEC-09 06:16:08.49623 +05:30 
+3839 | <IDLE> | 04-DEC-09 00:03:42.403237 +05:30 
+16984 | SELECT pg_stat_get_backend_pid(s.backendid) AS procpid, | 04-DEC-09 06:16:29.964375 +05:30 
+: pg_stat_get_backend_activity(s.backendid) AS current_query, pg_stat_get_backend_activity_start(s.backendid) AS T 
+: FROM (SELECT pg_stat_get_backend_idset() AS backendid) AS s; 
+(3 rows)
+
+====================================================================================================
+
+How to find out the toast table inside the database?
+
+You can find the TOAST table by executing the below query in database. 
+
+edb=# select relname,reltype,reltoastrelid from pg_class limit 10;
+         relname          | reltype | reltoastrelid 
+--------------------------+---------+---------------
+ pg_type                  |      71 |             0
+ pg_toast_14291           |   14294 |             0
+ pg_toast_14291_index     |       0 |             0
+ edb$session_wait_history |   14292 |         14293
+ session_waits_hist_pk    |       0 |             0
+ edb$stat_all_indexes     |   14299 |             0
+ edb$stat_idx_pk          |       0 |             0
+ edb$stat_all_tables      |   14303 |             0
+ edb$stat_tab_pk          |       0 |             0
+ edb$stat_database        |   14307 |             0
+(10 rows)
+
+====================================================================================================
+How to get number of sequential and index scans done on a table and index?
+
+First select the oid of the table name which you want to see the number of sequential scans done on it, by using the below command 
+
+
+edb=# select oid from pg_class where relname='emp'; 
+
+oid 
+
+------- 
+
+16390 
+
+(1 row) 
+
+
+use pg_stat_get_numscans(oid) as: 
+
+
+edb=# select pg_stat_get_numscans(16390); 
+
+pg_stat_get_numscans 
+
+---------------------- 
+
+1 
+
+
+to get number of index scans use oid of index in pg_stat_get_numscans(oid) as: 
+
+
+edb=# select oid from pg_class where relname='emp_pk'; 
+
+oid 
+
+------- 
+
+16393 
+
+(1 row) 
+
+
+edb=# select pg_stat_get_numscans(16393); 
+
+pg_stat_get_numscans 
+
+---------------------- 
+
+17 
+
+(1 row)
+
+====================================================================================================
+How to get process ID of the server process attached to the current session?
+
+To get the process ID of the server process attached to the current session, execute below command in the sql prompt, 
+
+edb=# select pg_backend_pid(); 
+pg_backend_pid 
+---------------- 
+16984 
+(1 row)
+
+====================================================================================================
+
+How to build the encrypt/decrypt functions for PPAS/PG.
+
+In PPAS/PG, The pgcrypto function can be used for encrypt/decrypt the sensitive data. 
+
+Also, Please find the below codes, as an example for creating encrypt/decrypt functions.: 
+
+declare 
+original_data text := 'I am going to be encrypted'; 
+data bytea; 
+cipher bytea; 
+crypto_type text; 
+encrypted_data bytea; 
+final_string text; 
+begin 
+
+-- conversion to bytea, could use cast too 
+data := original_data; 
+--set cipher key 
+cipher := 'not a strong key, use pgp instead'; 
+-- select type: aes or blowfish (bf) 
+crypto_type := 'aes'; 
+-- encrypt the data 
+select encrypt(data, cipher, crypto_type) into encrypted_data; 
+dbms_output.put_line('Encrypted: ' || encrypted_data ); 
+-- decrypt the data 
+select decrypt(encrypted_data, cipher, crypto_type) into final_string; 
+dbms_output.put_line('Decrypted: ' || final_string ); 
+end; 
+
+For More Detail please follow the link given below: 
+http://www.enterprisedb.com/docs/en/8.4/pg/pgcrypto.html
+====================================================================================================
+The detail information of Database User can use following command:
+
+SELECT datname as Database, pg_get_userbyid(datdba) AS dba, pg_catalog.pg_encoding_to_char(encoding) AS encoding, datcollate as Collate, datctype as CTYPE, datistemplate, datallowconn, datconnlimit, datlastsysoid, datfrozenxid, spcname as tablespace, pg_size_pretty(pg_database_size(datname)) AS size, datacl, age(datfrozenxid) AS freezeage, ROUND(100*(age(datfrozenxid)/freez::float)) AS perc FROM pg_database, pg_tablespace JOIN (SELECT setting AS freez FROM pg_settings WHERE name = 'autovacuum_freeze_max_age') AS param ON (true) WHERE dattablespace = pg_tablespace.oid ORDER BY datname ;
+====================================================================================================
+SELECT c.oid::regclass as table_name, age(relfrozenxid) as xid_age, 
+    pg_size_pretty(pg_table_size(oid)) as table_size
+FROM pg_class c 
+WHERE relkind = 'r' and pg_table_size(oid) > 1073741824
+ORDER BY age(relfrozenxid) DESC LIMIT 20;
+====================================================================================================
+====================================================================================================
